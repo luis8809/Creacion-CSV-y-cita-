@@ -271,6 +271,13 @@
     return (s===undefined||s===null) ? "" :
       s.toString().normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim();
   }
+  function escapeRegex(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+  // Exige que el token empiece una "palabra" dentro de la cabecera normalizada.
+  // Evita falsos positivos como "po" dentro de "tipo" o "deposito", pero sigue
+  // permitiendo que "po" case con "PO"/"Pedido" y "suc" con "Suc"/"Sucursal".
+  function tokenMatches(norm, token){
+    return new RegExp("(^|[^a-z0-9])" + escapeRegex(token)).test(norm);
+  }
   function colLetter(idx){ // 0-based -> "A","B",...
     let s = "";
     idx = idx + 1;
@@ -427,16 +434,30 @@
 
   function autoDetectMapping(){
     currentMapping = {};
+    const usedCols = new Set();
     REQUIRED_FIELDS.forEach(field=>{
       let best = -1;
       for(const tokens of field.must){
-        for(let c=0; c<columnHeaders.length; c++){
-          const norm = normalize(columnHeaders[c]);
-          if(tokens.every(t=>norm.includes(t))){ best = c; break; }
+        // 1ª pasada: cabecera EXACTAMENTE igual al token (la más fiable, evita
+        // falsos positivos tipo "Posición" casando con el token corto "po")
+        if(tokens.length===1){
+          for(let c=0; c<columnHeaders.length; c++){
+            if(usedCols.has(c)) continue;
+            if(normalize(columnHeaders[c])===tokens[0]){ best=c; break; }
+          }
+        }
+        // 2ª pasada: coincidencia por inicio de palabra dentro de la cabecera
+        if(best<0){
+          for(let c=0; c<columnHeaders.length; c++){
+            if(usedCols.has(c)) continue; // una columna ya asignada no se reutiliza para otro campo
+            const norm = normalize(columnHeaders[c]);
+            if(tokens.every(t=>tokenMatches(norm,t))){ best = c; break; }
+          }
         }
         if(best>=0) break;
       }
       currentMapping[field.key] = best;
+      if(best>=0) usedCols.add(best);
     });
   }
 
@@ -484,6 +505,12 @@
     if(/^\d+$/.test(t)) return String(parseInt(t,10));
     return t;
   }
+  // Albarán: el origen trae el número completo (p.ej. 5100526124) pero en el
+  // CSV y en la solicitud de cita solo se indican los ÚLTIMOS 6 DÍGITOS (526124).
+  function lastDigits(raw, n){
+    const digits = (raw===undefined||raw===null) ? "" : raw.toString().trim().replace(/\D/g,"");
+    return digits.length > n ? digits.slice(-n) : digits;
+  }
 
   function processBooking(){
     clearMsgs(step1msgs);
@@ -517,7 +544,7 @@
       const lugarDestinoNorm = stripLeadingZeros(lugarDestinoRaw);
       const uneco = (row[currentMapping.dpto]||"").toString().trim();
       const pedido = poVal;
-      const albaran = (row[currentMapping.alb]||"").toString().trim();
+      const albaran = lastDigits(row[currentMapping.alb], 6);
       const bultos = (row[currentMapping.bultos]||"").toString().trim();
       const fechaVal = currentMapping.fecha>=0 ? parseFlexDate(row[currentMapping.fecha]) : null;
 
