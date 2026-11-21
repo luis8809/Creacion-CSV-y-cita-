@@ -293,22 +293,47 @@ async function nominatim(params){
   return (await res.json())[0] || null;
 }
 
+const GEO_V = "geo2:";   // versión de caché: v2 busca solo cerca del CP
+const km = (a, b) => { const r = Math.PI/180, x = Math.sin((b.lat-a.lat)*r/2)**2 + Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin((b.lon-a.lon)*r/2)**2; return 12742 * Math.asin(Math.sqrt(x)); };
+
+// Centro y municipio de un código postal (se cachea)
+async function cpInfo(zip){
+  if (!zip) return null;
+  const k = "cp:" + zip, c = store.get(k); if (c) return c;
+  const hit = await nominatim({ postalcode: zip, country: "España" });
+  if (!hit) return null;
+  const a = hit.address || {};
+  const out = { lat: +hit.lat, lon: +hit.lon, town: a.city || a.town || a.village || a.municipality || "" };
+  store.set(k, out); return out;
+}
+
 async function geocode(query, zip){
-  const cacheKey = "geo:" + query + "|" + zip;
-  const cached = store.get(cacheKey);
+  const cacheKey = GEO_V + query + "|" + zip;
+  const old = store.get("geo:" + query + "|" + zip);
+  const cached = store.get(cacheKey) || (old?.label === "Ajustado a mano" ? old : null);
   if (cached) return cached;
+  const cp = await cpInfo(zip);
   let out = null;
   if (query){
-    const hit = await nominatim({ q: `${query}, ${zip}, España` }) || await nominatim({ street: query, postalcode: zip, country: "España" });
-    if (hit){
+    const town = cp?.town && !query.toUpperCase().includes(cp.town.toUpperCase()) ? cp.town : "";
+    const withDe = query.replace(/^(AVENIDA|CALLE|CARRETERA|PASEO|PLAZA|CAMINO|RONDA) (?!DE |DEL |LA |EL |LOS |LAS )/i, "$1 DE ");
+    // Solo se aceptan resultados dentro de la zona del CP (evita calles homónimas de otros pueblos)
+    const area = cp ? { viewbox: [cp.lon - 0.12, cp.lat + 0.09, cp.lon + 0.12, cp.lat - 0.09].join(","), bounded: 1 } : {};
+    const tries = [{ q: [query, zip, town].filter(Boolean).join(", "), ...area }];
+    if (withDe !== query) tries.push({ q: [withDe, town].filter(Boolean).join(", "), ...area });
+    tries.push({ q: [query, town].filter(Boolean).join(", "), ...area });
+    for (const t of tries){
+      const hit = await nominatim(t);
+      if (!hit) continue;
+      const p = { lat: +hit.lat, lon: +hit.lon };
+      if (cp && km(p, cp) > 10) continue;
       const pc = hit.address?.postcode || "";
-      out = { lat: +hit.lat, lon: +hit.lon, level: !pc || pc === zip ? "ok" : "revisar", label: hit.display_name };
+      const cand = { ...p, level: !pc || pc === zip ? "ok" : "revisar", label: hit.display_name };
+      if (cand.level === "ok"){ out = cand; break; }
+      out = out || cand;
     }
   }
-  if (!out && zip){
-    const hit = await nominatim({ postalcode: zip, country: "España" });
-    if (hit) out = { lat: +hit.lat, lon: +hit.lon, level: "cp", label: "Centro del CP " + zip };
-  }
+  if (!out && cp) out = { lat: cp.lat, lon: cp.lon, level: "cp", label: "Centro del CP " + zip + (cp.town ? " (" + cp.town + ")" : "") };
   out = out || { level: "error" };
   if (out.level !== "error") store.set(cacheKey, out);
   return out;
@@ -419,6 +444,8 @@ function schedule(){
 
 // ---------- Enlaces ----------
 const ll = p => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`;
+// Destino para Google Maps: coordenadas si la posición es fiable; si no, el texto (Google geocodifica mejor)
+const navDest = s => s.geo?.level === "ok" ? ll(s.geo) : `${s.query}, ${s.zip}, España`;
 function gmapsLinks(points){
   // Google Maps admite un número limitado de paradas intermedias por enlace: se trocea en tramos de 9.
   const out = [];
@@ -426,8 +453,8 @@ function gmapsLinks(points){
     const seg = points.slice(i, i + 11);
     const u = new URL("https://www.google.com/maps/dir/");
     u.searchParams.set("api", "1"); u.searchParams.set("travelmode", "driving");
-    u.searchParams.set("origin", ll(seg[0])); u.searchParams.set("destination", ll(seg[seg.length - 1]));
-    if (seg.length > 2) u.searchParams.set("waypoints", seg.slice(1, -1).map(ll).join("|"));
+    u.searchParams.set("origin", seg[0]); u.searchParams.set("destination", seg[seg.length - 1]);
+    if (seg.length > 2) u.searchParams.set("waypoints", seg.slice(1, -1).join("|"));
     out.push({ url: u.toString(), from: i, to: i + seg.length - 1 });
   }
   return out;
@@ -451,7 +478,16 @@ let map, layer;
 function drawMap(order){
   if (!map){
     map = L.map("map");
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
+    // Teselas de CARTO (los servidores de openstreetmap.org bloquean páginas abiertas como archivo local)
+    const carto = L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+      { maxZoom: 19, subdomains: "abcd", attribution: "© OpenStreetMap © CARTO" }).addTo(map);
+    let errors = 0;
+    carto.on("tileerror", () => {
+      if (++errors !== 5) return;   // varios fallos seguidos: cambiar a Esri
+      map.removeLayer(carto);
+      L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        { maxZoom: 19, attribution: "© Esri" }).addTo(map);
+    });
     layer = L.layerGroup().addTo(map);
     map.setView([40.42, -3.6], 10);
   }
@@ -472,7 +508,7 @@ function drawMap(order){
     mk.on("dragend", () => {
       const p = mk.getLatLng();
       s.geo = { lat: p.lat, lon: p.lng, level: "ok", label: "Ajustado a mano" };
-      store.set("geo:" + s.query + "|" + s.zip, s.geo);
+      store.set(GEO_V + s.query + "|" + s.zip, s.geo);
       state.route = null; setStatus("Posición corregida. Vuelve a calcular la ruta."); render();
     });
     bounds.push([s.geo.lat, s.geo.lon]);
@@ -510,7 +546,7 @@ function render(){
   $("#kpis").innerHTML = k;
 
   if (sch){
-    const pts = [state.depot.geo, ...order.map(s => s.geo), state.depot.geo];
+    const pts = [ll(state.depot.geo), ...order.map(navDest), ll(state.depot.geo)];
     const links = gmapsLinks(pts);
     $("#links").innerHTML = links.map((l, i) =>
       `<a class="btn" target="_blank" rel="noopener" href="${esc(l.url)}">Google Maps ${links.length > 1 ? `tramo ${i+1} (${l.from === 0 ? "almacén" : "parada " + l.from} → ${l.to === pts.length-1 ? "almacén" : "parada " + l.to})` : "(ruta completa)"}</a>`
@@ -529,7 +565,7 @@ function render(){
       <div><span class="tag ${s.kind}">${{E:"ENTREGA",R:"RECOGIDA",M:"ENT+REC"}[s.kind]}</span><span class="title">${esc(s.names)}</span></div>
       <div class="right">
         ${r ? `<span class="eta">${fmtMin(r.arrive)}</span>` : ""}
-        ${s.geo?.lat ? `<a class="btn" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${ll(s.geo)}">Navegar</a>` : ""}
+        ${s.geo?.lat ? `<a class="btn" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(navDest(s))}">Navegar</a>` : ""}
         ${sch ? `<span class="move"><button data-mv="-1" data-i="${i}" ${i === 0 ? "disabled" : ""} aria-label="Subir">↑</button><button data-mv="1" data-i="${i}" ${i === order.length - 1 ? "disabled" : ""} aria-label="Bajar">↓</button></span>` : ""}
         ${sch ? `<label style="flex-direction:row;align-items:center"><input type="checkbox" data-done="${esc(s.key)}" ${isDone ? "checked" : ""}> hecho</label>` : ""}
       </div>
