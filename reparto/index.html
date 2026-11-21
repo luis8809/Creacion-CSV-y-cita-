@@ -214,11 +214,21 @@ function readRows(wb){
   }).filter(r => r.addr || r.zip);
 }
 
+// Correcciones de direcciones conocidas (dirección original|CP -> texto de búsqueda).
+// Las que corrijas en la app se guardan en este navegador y tienen prioridad.
+const ADDRESS_FIXES = {
+  "COMERCIAL H 2-4|28521": "CENTRO COMERCIAL H2O, RIVAS-VACIAMADRID",
+  "ARES 2 LOCAL B 39-40 P|28051": "CENTRO COMERCIAL LA GAVIA, MADRID",
+  "CARRETERA DE ARGANDA A CHINCHON, KM|28500": "CARRETERA DE ARGANDA A CHINCHON KM 2, ARGANDA DEL REY",
+};
+const fixKey = (addr, zip) => clean(addr).toUpperCase().replace(/\s+/g, " ") + "|" + zip;
+const queryFor = (addr, zip) => store.get("fix:" + fixKey(addr, zip)) || ADDRESS_FIXES[fixKey(addr, zip)] || cleanAddr(addr);
+
 function buildStops(rows){
   const map = new Map();
   for (const r of rows){
     const key = cleanAddr(r.addr) + "|" + r.zip;
-    if (!map.has(key)) map.set(key, { key, name: r.name, addr: r.addr, zip: r.zip, extra: r.extra, items: [], query: cleanAddr(r.addr) });
+    if (!map.has(key)) map.set(key, { key, name: r.name, addr: r.addr, zip: r.zip, extra: r.extra, items: [], query: queryFor(r.addr, r.zip) });
     map.get(key).items.push(r);
   }
   return [...map.values()].map((s, i) => {
@@ -552,6 +562,7 @@ $("#stops").addEventListener("click", async e => {
   const id = e.target.dataset.fix; if (id === undefined) return;
   const s = state.stops[+id];
   s.query = $(`[data-q="${id}"]`).value.trim();
+  store.set("fix:" + fixKey(s.addr, s.zip), s.query);
   e.target.disabled = true; setStatus("Buscando " + s.query + "…");
   try { s.geo = await geocode(s.query, s.zip); } catch (err) { s.geo = { level: "error" }; }
   state.route = null;
