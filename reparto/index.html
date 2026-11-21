@@ -122,16 +122,16 @@ select{max-width:100%}
         </select>
       </label>
     </div>
-    <p class="status" id="status">Carga el Excel para empezar.</p>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="optimize" disabled>Calcular ruta</button>
+      <button id="regeo" disabled>Reintentar direcciones</button>
+    </div>
+    <p class="status" id="status">Carga el Excel para empezar (export de operaciones o Excel de paradas).</p>
   </section>
 
   <section id="resultSec" hidden>
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <h2 style="margin:0" id="stopsTitle">2. Paradas</h2>
-      <div class="row">
-        <button id="regeo">Reintentar direcciones</button>
-        <button class="primary" id="optimize">Calcular ruta</button>
-      </div>
     </div>
     <div class="kpis" id="kpis"></div>
     <div id="map"></div>
@@ -187,9 +187,11 @@ function parseWindow(t){
 // ---------- Lectura del Excel ----------
 const state = { rows: [], stops: [], depot: null, route: null, trip: "" };
 
-function readRows(wb){
+function readRows(wb, fileName){
   const ws = wb.Sheets[wb.SheetNames[0]];
   const data = XLSX.utils.sheet_to_json(ws, { defval: null });
+  const heads = Object.keys(data[0] || {}).map(h => h.trim().toLowerCase());
+  if (!heads.includes("operation type") && heads.includes("cp") && heads.includes("tipo")) return readStopsSheet(data, fileName);
   return data.map(r => {
     const g = name => { const k = Object.keys(r).find(k => k.trim().toLowerCase() === name.toLowerCase()); return k ? r[k] : null; };
     const op = clean(g("Operation Type"));
@@ -214,6 +216,28 @@ function readRows(wb){
   }).filter(r => r.addr || r.zip);
 }
 
+// Excel de paradas generado/revisado (hoja "Paradas"): una fila por parada
+function readStopsSheet(data, fileName){
+  const trip = (String(fileName || "").match(/[A-Z]{6}\d{6,}/) || [""])[0];
+  const out = [];
+  for (const r of data){
+    const g = name => { const k = Object.keys(r).find(k => k.trim().toLowerCase() === name.toLowerCase()); return k ? r[k] : null; };
+    const tipo = clean(g("Tipo")).toLowerCase();
+    if (!/entrega|recogida/.test(tipo)) continue;            // salta la fila TOTAL y vacías
+    const base = {
+      op: clean(g("Tipo")), trip, ref: clean(g("Referencias")), name: clean(g("Cliente")),
+      addr: clean(g("Dirección (original)") || g("Dirección")), zip: clean(g("CP")), extra: "",
+      query: clean(g("Dirección para buscar")), qty: "", unit: clean(g("Bultos")),
+      note: clean(g("Notas")), window: parseWindow(g("Ventana horaria")),
+      tailLift: /s[ií]/i.test(clean(g("Trampilla"))), depotAddr: "", depotZip: "",
+    };
+    const kgE = +g("Kg entrega") || 0, kgR = +g("Kg recogida") || 0;
+    if (/entrega/.test(tipo)) out.push({ ...base, kind: "E", kg: kgE });
+    if (/recogida/.test(tipo)) out.push({ ...base, kind: "R", kg: kgR, unit: /entrega/.test(tipo) ? "" : base.unit });
+  }
+  return out.filter(r => r.addr || r.zip);
+}
+
 // Correcciones de direcciones conocidas (dirección original|CP -> texto de búsqueda).
 // Las que corrijas en la app se guardan en este navegador y tienen prioridad.
 const ADDRESS_FIXES = {
@@ -228,7 +252,7 @@ function buildStops(rows){
   const map = new Map();
   for (const r of rows){
     const key = cleanAddr(r.addr) + "|" + r.zip;
-    if (!map.has(key)) map.set(key, { key, name: r.name, addr: r.addr, zip: r.zip, extra: r.extra, items: [], query: queryFor(r.addr, r.zip) });
+    if (!map.has(key)) map.set(key, { key, name: r.name, addr: r.addr, zip: r.zip, extra: r.extra, items: [], query: store.get("fix:" + fixKey(r.addr, r.zip)) || r.query || queryFor(r.addr, r.zip) });
     map.get(key).items.push(r);
   }
   return [...map.values()].map((s, i) => {
@@ -240,7 +264,7 @@ function buildStops(rows){
       names: [...new Set(s.items.map(x => x.name))].join(" / "),
       kgE: s.items.filter(x => x.kind === "E").reduce((a, x) => a + x.kg, 0),
       kgR: s.items.filter(x => x.kind === "R").reduce((a, x) => a + x.kg, 0),
-      qty: s.items.map(x => `${x.qty} ${x.unit}`).join(" + "),
+      qty: s.items.map(x => `${x.qty} ${x.unit}`.trim()).filter(Boolean).join(" + "),
       window: wins.length ? { from: Math.max(...wins.map(w => w.from)), to: Math.min(...wins.map(w => w.to)) } : null,
       notes: [...new Set(s.items.flatMap(x => x.note.split("\n")).map(l => l.replace(/^[|\s.\/]+/, "").trim()).filter(l => /[a-z0-9]/i.test(l)))].join("\n"),
       tailLift: s.items.some(x => x.tailLift),
@@ -523,10 +547,12 @@ function render(){
 // ---------- Eventos ----------
 $("#file").addEventListener("change", async e => {
   const f = e.target.files[0]; if (!f) return;
+  if (typeof XLSX === "undefined" || typeof L === "undefined")
+    return setStatus("No se han podido cargar las librerías (sin conexión o el visor bloquea scripts). Abre el archivo en Chrome, Edge o Safari con Internet.");
   try {
     const wb = XLSX.read(await f.arrayBuffer(), { type: "array" });
-    const all = readRows(wb);
-    if (!all.length) return setStatus("No se han encontrado filas con dirección. ¿Es el export de operaciones?");
+    const all = readRows(wb, f.name);
+    if (!all.length) return setStatus("No se han encontrado paradas en el archivo. Usa el export de operaciones (columnas Operation Type, Loading/Unloading Address…) o el Excel de paradas.");
     const trips = [...new Set(all.map(r => r.trip))];
     $("#trip").innerHTML = trips.map(t => `<option>${esc(t || "(sin viaje)")}</option>`).join("");
     $("#tripWrap").hidden = trips.length < 2;
@@ -543,6 +569,7 @@ function loadTrip(trip){
   state.route = null;
   const d = guessDepot(state.rows); if (d) $("#depot").value = d;
   $("#tripLabel").textContent = trip ? "Viaje " + trip : "";
+  $("#optimize").disabled = $("#regeo").disabled = !state.stops.length;
   render();
   geocodeAll(false);
 }
